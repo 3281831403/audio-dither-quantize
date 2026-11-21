@@ -1,8 +1,5 @@
 """Dither and quantization primitives for the audio-dither-quantize exercise.
 
-This module is deliberately shipped as stubs: every public function raises
-``NotImplementedError``.
-
 Audio is represented as a normalized ``list[float]``.  For a signed ``b``-bit
 format, sample ``1.0`` corresponds to ``2 ** (b - 1)`` codes, the code range is
 ``[-2 ** (b - 1), 2 ** (b - 1) - 1]``, and one LSB is ``2 ** (1 - b)`` in
@@ -13,9 +10,64 @@ unless a tighter absolute tolerance is stated.
 
 from __future__ import annotations
 
+import hashlib
+import math
+
+LSB16 = 2.0 ** -15
+_HASH_DOMAIN = 1 << 256
+
 
 class DitherError(ValueError):
     """Raised when dither parameters, audio data, or batch tracks are invalid."""
+
+
+def _is_real_int(value: object) -> bool:
+    """Return True for genuine ints (booleans are rejected as not real ints)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _validate_seed(seed: object) -> None:
+    if not _is_real_int(seed):
+        raise DitherError(f"seed must be an integer, got {type(seed).__name__}")
+
+
+def _validate_count(n: object) -> None:
+    if not _is_real_int(n) or n < 0:
+        raise DitherError(f"n must be a non-negative integer, got {n!r}")
+
+
+def _validate_bit_depth(bit_depth: object) -> None:
+    if not _is_real_int(bit_depth) or bit_depth < 1:
+        raise DitherError(
+            f"bit_depth must be an integer >= 1, got {bit_depth!r}"
+        )
+
+
+def _validate_samples(samples: object, *, allow_empty: bool = True) -> list:
+    if not isinstance(samples, list):
+        raise DitherError(
+            f"samples must be a list, got {type(samples).__name__}"
+        )
+    if not allow_empty and len(samples) == 0:
+        raise DitherError("samples must not be empty")
+    for sample in samples:
+        if not isinstance(sample, (int, float)) or isinstance(sample, bool):
+            raise DitherError(f"sample must be numeric, got {sample!r}")
+        if not math.isfinite(sample):
+            raise DitherError(f"sample must be finite, got {sample!r}")
+    return samples
+
+
+def _uniform(seed: int, index: int, stream: int) -> float:
+    """Deterministic uniform value in [0, 1) from a SHA-256 hash.
+
+    The payload canonically binds the seed, the sample index, and a distinct
+    stream number, so no global random state or salted hash() is involved and
+    the output is identical on every call, process, and platform.
+    """
+    payload = f"audio-dither:v1:{stream}:{seed}:{index}".encode("utf-8")
+    digest = hashlib.sha256(payload).digest()
+    return int.from_bytes(digest, "big") / _HASH_DOMAIN
 
 
 def tpdf_noise(seed: int, n: int) -> list[float]:
@@ -43,7 +95,12 @@ def tpdf_noise(seed: int, n: int) -> list[float]:
         DitherError: If ``n`` is not an integer, ``n < 0``, or ``seed`` is not
             an integer.
     """
-    raise NotImplementedError
+    _validate_seed(seed)
+    _validate_count(n)
+    return [
+        (_uniform(seed, i, 0) - _uniform(seed, i, 1)) * LSB16
+        for i in range(n)
+    ]
 
 
 def rectangular_noise(seed: int, n: int) -> list[float]:
@@ -69,7 +126,22 @@ def rectangular_noise(seed: int, n: int) -> list[float]:
         DitherError: If ``n`` is not an integer, ``n < 0``, or ``seed`` is not
             an integer.
     """
-    raise NotImplementedError
+    _validate_seed(seed)
+    _validate_count(n)
+    return [(_uniform(seed, i, 2) - 0.5) * LSB16 for i in range(n)]
+
+
+def _round_half_away(value: float) -> int:
+    """Round to the nearest integer, with ties rounded away from zero."""
+    floored = math.floor(value)
+    fraction = value - floored
+    if fraction < 0.5:
+        return floored
+    if fraction > 0.5:
+        return floored + 1
+    # Exact tie: away from zero.  For negative values floor() already moved
+    # away from zero (e.g. floor(-2.5) == -3), so the floored value is kept.
+    return floored + 1 if value > 0 else floored
 
 
 def quantize(samples: list[float], bit_depth: int) -> list[int]:
@@ -98,7 +170,19 @@ def quantize(samples: list[float], bit_depth: int) -> list[int]:
         DitherError: If ``bit_depth < 1``, ``bit_depth`` is not an integer, the
             input is not a sequence, or a sample is not finite.
     """
-    raise NotImplementedError
+    _validate_bit_depth(bit_depth)
+    _validate_samples(samples)
+    scale = 1 << (bit_depth - 1)
+    low, high = -scale, scale - 1
+    codes = []
+    for sample in samples:
+        code = _round_half_away(sample * scale)
+        if code < low:
+            code = low
+        elif code > high:
+            code = high
+        codes.append(code)
+    return codes
 
 
 def dequantize(codes: list[int], bit_depth: int) -> list[float]:
@@ -122,7 +206,46 @@ def dequantize(codes: list[int], bit_depth: int) -> list[float]:
         DitherError: If ``bit_depth < 1``, a code is not an integer, or a code
             falls outside the signed range for ``bit_depth``.
     """
-    raise NotImplementedError
+    _validate_bit_depth(bit_depth)
+    if not isinstance(codes, list):
+        raise DitherError(f"codes must be a list, got {type(codes).__name__}")
+    scale = 1 << (bit_depth - 1)
+    low, high = -scale, scale - 1
+    result = []
+    for code in codes:
+        if not _is_real_int(code):
+            raise DitherError(f"code must be an integer, got {code!r}")
+        if code < low or code > high:
+            raise DitherError(
+                f"code {code} outside signed {bit_depth}-bit range "
+                f"[{low}, {high}]"
+            )
+        result.append(code / scale)
+    return result
+
+
+def _validate_shape(shape: object) -> list[float] | None:
+    """Validate a noise-shape argument and return a normalized list."""
+    if shape is None or shape == []:
+        return [] if shape is not None else None
+    if not isinstance(shape, list) or len(shape) != 1:
+        raise DitherError(
+            "shape must be None, [], or a single-coefficient list [c]"
+        )
+    coefficient = shape[0]
+    if not isinstance(coefficient, (int, float)) or isinstance(
+        coefficient, bool
+    ):
+        raise DitherError(f"shape coefficient must be numeric, got {coefficient!r}")
+    if not math.isfinite(coefficient):
+        raise DitherError(
+            f"shape coefficient must be finite, got {coefficient!r}"
+        )
+    if abs(coefficient) >= 1.0:
+        raise DitherError(
+            f"shape coefficient must satisfy abs(c) < 1, got {coefficient!r}"
+        )
+    return [float(coefficient)]
 
 
 def noise_shape(samples: list[float], coefficients: list[float]) -> list[float]:
@@ -159,7 +282,43 @@ def noise_shape(samples: list[float], coefficients: list[float]) -> list[float]:
             the coefficient sequence has more than one element or is unstable
             (``abs(c) >= 1``).
     """
-    raise NotImplementedError
+    _validate_samples(samples)
+    if not isinstance(coefficients, list):
+        raise DitherError(
+            "coefficients must be a list, got "
+            f"{type(coefficients).__name__}"
+        )
+    if len(coefficients) == 0:
+        return list(samples)
+    if len(coefficients) > 1:
+        raise DitherError(
+            f"first-order shaping accepts exactly one coefficient, got "
+            f"{len(coefficients)}"
+        )
+    coefficient = coefficients[0]
+    if not isinstance(coefficient, (int, float)) or isinstance(
+        coefficient, bool
+    ):
+        raise DitherError(
+            f"coefficient must be numeric, got {coefficient!r}"
+        )
+    if not math.isfinite(coefficient):
+        raise DitherError(f"coefficient must be finite, got {coefficient!r}")
+    if abs(coefficient) >= 1.0:
+        raise DitherError(
+            f"feedback coefficient must satisfy abs(c) < 1, got {coefficient!r}"
+        )
+
+    shaped: list[float] = []
+    previous = 0.0
+    for index, sample in enumerate(samples):
+        if index == 0:
+            value = float(sample)
+        else:
+            value = sample + coefficient * previous
+        shaped.append(value)
+        previous = value
+    return shaped
 
 
 def apply_dither(
@@ -196,7 +355,42 @@ def apply_dither(
         DitherError: If ``bit_depth < 1``, a sample is not finite, ``seed`` is
             invalid, or ``shape`` is malformed or unstable.
     """
-    raise NotImplementedError
+    _validate_bit_depth(bit_depth)
+    _validate_samples(samples)
+    _validate_seed(seed)
+    normalized_shape = _validate_shape(shape)
+
+    scale = 1 << (bit_depth - 1)
+    low, high = -scale, scale - 1
+    # Re-scale the 16-bit-reference dither to the target bit depth so its peak
+    # stays at exactly one target LSB.
+    dither_gain = float(1 << (16 - bit_depth)) if bit_depth <= 16 else 1.0 / (
+        1 << (bit_depth - 16)
+    )
+    noise = tpdf_noise(seed, len(samples))
+    coefficient = (
+        normalized_shape[0] if normalized_shape else 0.0
+    )
+    use_shaping = normalized_shape is not None and len(normalized_shape) == 1
+
+    codes: list[int] = []
+    previous_error = 0.0
+    for index, sample in enumerate(samples):
+        dither_value = noise[index] * dither_gain
+        if use_shaping:
+            adjusted = sample + coefficient * previous_error + dither_value
+        else:
+            adjusted = sample + dither_value
+        code = _round_half_away(adjusted * scale)
+        if code < low:
+            code = low
+        elif code > high:
+            code = high
+        codes.append(code)
+        if use_shaping:
+            reconstructed = code / scale
+            previous_error = reconstructed - adjusted
+    return codes
 
 
 def measure_snr(original: list[float], quantized: list[float]) -> float:
@@ -225,7 +419,27 @@ def measure_snr(original: list[float], quantized: list[float]) -> float:
         DitherError: If either sequence is empty, the lengths differ, or any
             value is not finite.
     """
-    raise NotImplementedError
+    _validate_samples(original, allow_empty=False)
+    _validate_samples(quantized, allow_empty=False)
+    if len(original) != len(quantized):
+        raise DitherError(
+            f"length mismatch: original has {len(original)} samples, "
+            f"quantized has {len(quantized)}"
+        )
+
+    count = len(original)
+    signal_power = sum(value * value for value in original) / count
+    noise_power = (
+        sum(
+            (a - b) * (a - b)
+            for a, b in zip(original, quantized)
+        )
+        / count
+    )
+
+    if signal_power == 0.0 or noise_power == 0.0:
+        return float("inf")
+    return 10.0 * math.log10(signal_power / noise_power)
 
 
 def dither_batch(tracks: list[dict], config: dict) -> dict:
@@ -269,4 +483,58 @@ def dither_batch(tracks: list[dict], config: dict) -> dict:
             or non-finite, the sample list is empty, or the batch
             ``bit_depth``/``shape``/``seed`` is invalid.
     """
-    raise NotImplementedError
+    if not isinstance(config, dict):
+        raise DitherError(
+            f"config must be a mapping, got {type(config).__name__}"
+        )
+    if "bit_depth" not in config:
+        raise DitherError("config is missing required 'bit_depth'")
+    bit_depth = config["bit_depth"]
+    _validate_bit_depth(bit_depth)
+
+    shape = config.get("shape")
+    normalized_shape = _validate_shape(shape)
+
+    seed = config.get("seed", 0)
+    _validate_seed(seed)
+
+    if not isinstance(tracks, list):
+        raise DitherError(
+            f"tracks must be a list, got {type(tracks).__name__}"
+        )
+
+    # Validate every track before any processing begins so the batch is
+    # atomic: no partial result can be produced and inputs are never mutated.
+    seen_names: set[str] = set()
+    for position, track in enumerate(tracks):
+        if not isinstance(track, dict):
+            raise DitherError(
+                f"track {position} must be a mapping, got "
+                f"{type(track).__name__}"
+            )
+        if "name" not in track:
+            raise DitherError(f"track {position} is missing 'name'")
+        name = track["name"]
+        if not isinstance(name, str) or name == "":
+            raise DitherError(
+                f"track {position} name must be a non-empty string, got "
+                f"{name!r}"
+            )
+        if name in seen_names:
+            raise DitherError(f"duplicate track name: {name!r}")
+        seen_names.add(name)
+        if "samples" not in track:
+            raise DitherError(f"track {name!r} is missing 'samples'")
+        _validate_samples(track["samples"], allow_empty=False)
+
+    result_tracks = []
+    for index, track in enumerate(tracks):
+        codes = apply_dither(
+            track["samples"],
+            bit_depth,
+            normalized_shape,
+            seed + index,
+        )
+        result_tracks.append({"name": track["name"], "codes": codes})
+
+    return {"bit_depth": bit_depth, "tracks": result_tracks}
